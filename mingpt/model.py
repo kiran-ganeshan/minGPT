@@ -33,6 +33,14 @@ class GPT1Config(GPTConfig):
     n_layer = 12
     n_head = 12
     n_embd = 768
+    
+class RoGPT1Config(GPT1Config):
+    """ GPT-1 like network with rotary embeddings """
+    rotary = True
+    
+class GenRoGPT1Config(RoGPT1Config):
+    """ GPT-1 like network with generalized rotary embeddings """
+    gen_rotary = True
 
 class CausalSelfAttention(nn.Module):
     """
@@ -43,11 +51,22 @@ class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        assert config.n_embd % config.n_head == 0
+        # Check n_embd divisible by n_head and dividend divisible by 2
+        assert config.n_embd % (2 * config.n_head) == 0
+        if config.rotary and config.gen_rotary:
+            assert config.n_embd % (config.n_head * config.n_rotary) == 0
+        rotary_blocks = config.n_embd // (2 * config.n_head)
         # key, query, value projections for all heads
         self.key = nn.Linear(config.n_embd, config.n_embd)
         self.query = nn.Linear(config.n_embd, config.n_embd)
         self.value = nn.Linear(config.n_embd, config.n_embd)
+        
+        if config.rotary:
+            if config.gen_rotary:
+                block_size = config.n_embd // (config.n_head * config.n_rotary)
+                self.theta = nn.Parameter(torch.rand(config.n_head, config.n_rotary, block_size, block_size))
+            else:
+                self.theta = nn.Parameter(torch.ones(config.n_head, rotary_blocks))
         # regularization
         self.attn_drop = nn.Dropout(config.attn_pdrop)
         self.resid_drop = nn.Dropout(config.resid_pdrop)
@@ -57,14 +76,28 @@ class CausalSelfAttention(nn.Module):
         self.register_buffer("mask", torch.tril(torch.ones(config.block_size, config.block_size))
                                      .view(1, 1, config.block_size, config.block_size))
         self.n_head = config.n_head
+        self.rotary = config.rotary
+        self.gen_rotary = config.gen_rotary
+        self.n_blocks = config.n_blocks if self.gen_rotary else None
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-
+        if self.rotary and self.gen_rotary:
+            rotate = self.gen_rotate
+        elif self.rotary:
+            rotate = self.rotate
+        else:
+            rotate = nn.Identity
+        
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        k = self.key(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = self.query(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = self.value(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        k = self.key(x).view(B, T, self.n_head, C // self.n_head)
+        k = rotate(k).transpose(1, 2) # (B, nh, T, hs)
+        q = self.query(x).view(B, T, self.n_head, C // self.n_head)
+        q = rotate(q).transpose(1, 2) # (B, nh, T, hs)
+        v = self.value(x).view(B, T, self.n_head, C // self.n_head)
+        if self.rotate_values:
+            v = rotate(v)
+        v = v.transpose(1, 2) # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
@@ -77,6 +110,22 @@ class CausalSelfAttention(nn.Module):
         # output projection
         y = self.resid_drop(self.proj(y))
         return y
+    
+    def rotate(self, x):
+        B, T, nh, hs = x.shape
+        x1, x2 = x[..., ::2], x[..., 1::2]
+        cos = torch.cos(torch.outer(torch.range(T), self.theta))[None, ...]
+        sin = torch.sin(torch.outer(torch.range(T), self.theta))[None, ...]
+        return torch.stack([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1).flatten(-1, -2)
+    
+    def gen_rotate(self, x):
+        B, T, nh, hs = x.shape
+        freqs = torch.outer(torch.range(T), self.theta - self.theta.T)
+        return torch.matrix_exp(freqs) @ x
+
+        
+        
+        
 
 class Block(nn.Module):
     """ an unassuming Transformer block """
